@@ -1616,7 +1616,7 @@ class AutoSwitchEngine:
         its own schedule, without the active ever needing to burn down to it.
 
         THE ORDINARY PATH HAS A REAL BASELINE (`leftHeadroom` is a number,
-        not null), so it gets three legs, checked in this order, each with
+        not null), so it gets four legs, checked in this order, each with
         the margin its axis already uses. Burn cannot manufacture any of
         them: headroom rises only when a window rolls over, the ratio needs
         the active to lose more than half its remaining headroom AND clear
@@ -1647,6 +1647,12 @@ class AutoSwitchEngine:
           recovery    `-RECOVERY_HYSTERESIS_S` against the DEPARTURE
                       baseline — the same margin the recovery axis ranks by
                       one gate later.
+          rolled over `leftRecoveryAt` has passed: the window that bound the
+                      departure has reset since. Wall clock crossing a
+                      recorded instant, which burn cannot fake. The headroom
+                      leg misses it whenever another window sits just under
+                      the threshold — left at 5h 90.5 with the week at 88,
+                      back at 5h 0 with the week at 88.5, is +2 pts.
 
         NO SNAPSHOT MEANS RELEASE. State written before this field existed, or
         by a switch that never recorded one, carries no evidence either way —
@@ -1780,6 +1786,8 @@ class AutoSwitchEngine:
         # live without anyone revisiting this function -- silently reading
         # None as "no dominance" would then be exactly the bug the
         # unreadable-active fallback was added for.
+        if isinstance(left_recovery, (int, float)) and left_recovery <= now:
+            return True          # the departure's binding window has reset
         if h is not None:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
