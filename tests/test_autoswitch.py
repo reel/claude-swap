@@ -3525,6 +3525,150 @@ class TestWeeklyFirstStrategy:
         assert h.active_number() == 3
 
 
+_HOUR = 3600.0
+_DAY = 24 * _HOUR
+
+
+def _usage_both(
+    pct5: float, reset5_in: float | None, pct7: float, reset7_in: float, now: float
+) -> dict:
+    """Usage with both windows' resets given as seconds from ``now``; a
+    ``reset5_in`` of None is an idle 5-hour window (no running reset)."""
+    five: dict = {"pct": pct5}
+    if reset5_in is not None:
+        five["resets_at"] = _iso_at(now + reset5_in)
+    return {
+        "five_hour": five,
+        "seven_day": {"pct": pct7, "resets_at": _iso_at(now + reset7_in)},
+    }
+
+
+class TestConsumeFirstFiveHourTiebreak:
+    """consume-first drains the soonest weekly reset first; weekly resets that
+    tie (within WEEKLY_TIE_FRACTION of the time left, capped at
+    WEEKLY_TIE_MAX_S) are ordered by the soonest RUNNING 5-hour window."""
+
+    def _harness(self, temp_home: Path) -> EngineHarness:
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_tied_weekly_resets_drain_the_running_5h_window_first(self, temp_home):
+        """Weekly resets 2h apart, six days out, tie. #3's 5-hour window is
+        running and resets in an hour, so what is left of it is lost unless
+        it is used now; #2's is idle and loses nothing by waiting. Weekly
+        order alone picked #2 (its reset is the sooner of the two)."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage_both(95, 2 * _HOUR, 20, 7 * _DAY, now),  # must move
+            "2": _usage_both(0, None, 10, 6 * _DAY, now),
+            "3": _usage_both(40, 1 * _HOUR, 10, 6 * _DAY + 2 * _HOUR, now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_a_clearly_sooner_weekly_reset_beats_a_running_5h_window(
+        self, temp_home
+    ):
+        """30% of the weekly window left, resetting in a day, against peers a
+        week out: the weekly quota is what expires for good, so it is drained
+        first even though #3's running 5-hour window resets in 30 minutes."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage_both(95, 2 * _HOUR, 20, 7 * _DAY, now),
+            "2": _usage_both(0, None, 70, 1 * _DAY, now),
+            "3": _usage_both(40, 0.5 * _HOUR, 10, 6 * _DAY, now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_the_tie_band_shrinks_as_the_week_runs_out(self, temp_home):
+        """Resets 5h and 9h out are four hours apart. A fixed 12h band would
+        call that a tie and spend the 5-hour window on #3 while #2's week
+        expires; relative to the five hours #2 has left, it is not a tie."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage_both(95, 2 * _HOUR, 20, 7 * _DAY, now),
+            "2": _usage_both(0, None, 50, 5 * _HOUR, now),
+            "3": _usage_both(40, 0.2 * _HOUR, 50, 9 * _HOUR, now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_below_threshold_stays_for_a_tied_weekly_reset(self, temp_home):
+        """A peer whose week ends an hour sooner, six days out, is a tie: the
+        proactive move would abandon the active's running 5-hour window for
+        no weekly gain. Weekly order alone moved here."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage_both(40, 3 * _HOUR, 20, 6 * _DAY, now),
+            "2": _usage_both(0, None, 10, 6 * _DAY - 1 * _HOUR, now),
+            "3": _usage_both(0, None, 10, 7 * _DAY, now),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["already-consuming-soonest"]
+
+    def test_below_threshold_still_leaves_for_a_clearly_sooner_week(
+        self, temp_home
+    ):
+        """Control for the test above: the same shape with #2's week ending a
+        day sooner is outside the band, so the proactive move still fires."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage_both(40, 3 * _HOUR, 20, 6 * _DAY, now),
+            "2": _usage_both(0, None, 10, 5 * _DAY, now),
+            "3": _usage_both(0, None, 10, 7 * _DAY, now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_landing_without_room_does_not_win_the_tie(self, temp_home):
+        """#2's running 5-hour window resets soonest in a weekly tie, but at
+        85% under a 90 line it has less than the hysteresis margin of room, so
+        the forced move prefers #3. The tie is only broken among candidates
+        that rank together."""
+        h = self._harness(temp_home)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage_both(95, 2 * _HOUR, 20, 7 * _DAY, now),  # must move
+            "2": _usage_both(85, 1 * _HOUR, 10, 6 * _DAY, now),
+            "3": _usage_both(0, None, 10, 6 * _DAY + 2 * _HOUR, now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_an_at_limit_escape_breaks_the_tie_among_targets_with_room(
+        self, temp_home
+    ):
+        """The escape's room bar comes first: #2 resets soonest on both
+        windows but sits at 85% under a 90 line. Between #3 and #4, which have
+        room and tie on the week, #4's running 5-hour window is drained
+        first."""
+        h = self._harness(temp_home)
+        h.seed(4, "d@example.com")
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": _usage_both(100, 2 * _HOUR, 20, 7 * _DAY, now),  # at its limit
+            "2": _usage_both(85, 0.5 * _HOUR, 10, 6 * _DAY - 1 * _HOUR, now),
+            "3": _usage_both(0, None, 10, 6 * _DAY, now),
+            "4": _usage_both(40, 1 * _HOUR, 10, 6 * _DAY + 2 * _HOUR, now),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 4
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "at-limit"
+
+
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
     """A `consume-first` departure's phase-2 refetch can write
     `(leftHeadroom, leftRecoveryAt) = (None, None)`, the exact snapshot
