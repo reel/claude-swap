@@ -8,7 +8,7 @@ Set with `--strategy`, or `cswap config set autoswitch.strategy`.
 
 - `best` (default) stays put until the active account nears its limit, then moves to the account with the most quota left.
 - `weekly-first` switches at the same lines as `best`, with the same landing rules and hysteresis margin, but among the accounts that qualify it lands on the one whose **weekly window resets soonest** (most quota left breaks ties), so weekly quota that would otherwise expire unused gets spent first. Its at-limit and failover escapes, and the all-over-the-lines case, rank by quota left exactly as `best` does.
-- `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
+- `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted. Weekly resets that are nearly simultaneous (within 10% of the time left, at most 12h apart) count as a tie, broken by the account whose running 5-hour window resets soonest, so what is left of that window is used before it is lost.
 - `priority-consume-first` follows your own ranking first (see *Account priority tiers* below), then the soonest weekly reset within a tier.
 
 ## Cooldown and hysteresis
