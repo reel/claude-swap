@@ -128,6 +128,17 @@ RECOVERY_HORIZON_S = 4 * 3600.0
 # target burns it back, and it ping-pongs. A ratio makes the move one-way.
 HORIZON_HEADROOM_RATIO = 2.0
 
+# consume-first's tie on the weekly axis. Two weekly resets this close together
+# cannot strand quota by the order they are drained in, so the 5-hour window
+# decides between them instead: a RUNNING 5-hour window loses whatever is left
+# in it at its reset, while an idle account's window has not started and loses
+# nothing by waiting. The band is a fraction of the time left before the
+# sooner weekly reset, so it shrinks toward nothing as that week runs out and
+# the weekly order starts to matter again; the cap keeps a far-off reset from a
+# stale snapshot from swallowing a real weekly difference.
+WEEKLY_TIE_FRACTION = 0.1
+WEEKLY_TIE_MAX_S = 12 * 3600.0
+
 # The two anti-flap thresholds are both anchored to `active_headroom`, which
 # leaves a band where a peer is VISIBLE (the spent clause goes false, so the
 # reset axis switches off) yet UNCHOOSABLE (it misses the margin). Measured,
@@ -539,22 +550,60 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
     """Epoch of an account's 7-day (weekly) window reset, or None if unknown
     or already past.
 
-    The consume-first strategy ranks by this — the weekly window is the
-    perishable quota (the 5-hour one recycles too fast to be worth planning
-    around). A stale snapshot can carry a ``resets_at`` that has since
-    elapsed; treated as a real instant it would sort the *just-rolled-over*
-    account (the least perishable quota of all) as "soonest", so past ==
-    unknown. Plain ``ts <= now``: RESET_SLACK_S is poll-scheduling lag
-    tolerance, not ranking input — padding here would turn a genuinely
-    imminent reset into a false reset-unknown hold.
+    The consume-first strategy ranks by this first — the weekly window is the
+    perishable quota. The 5-hour reset only decides between weekly resets
+    that tie (``WEEKLY_TIE_FRACTION``). A stale snapshot can carry a
+    ``resets_at`` that has since elapsed; treated as a real instant it would
+    sort the *just-rolled-over* account (the least perishable quota of all) as
+    "soonest", so past == unknown. Plain ``ts <= now``: RESET_SLACK_S is
+    poll-scheduling lag tolerance, not ranking input — padding here would turn
+    a genuinely imminent reset into a false reset-unknown hold.
     """
+    return _window_reset_ts(usage, "seven_day", now)
+
+
+def _window_reset_ts(
+    usage: dict | str | None, window_key: str, now: float
+) -> float | None:
+    """Epoch of one window's reset (``"five_hour"``, ``"seven_day"``), or None
+    if unknown or already past — past == unknown, as above."""
     if isinstance(usage, dict):
-        window = usage.get("seven_day")
+        window = usage.get(window_key)
         if isinstance(window, dict):
             ts = _parse_reset_ts(window.get("resets_at"))
             if ts is not None and ts > now:
                 return ts
     return None
+
+
+def _weekly_tie_band(sooner_reset_ts: float, now: float) -> float:
+    """Seconds within which a weekly reset ties ``sooner_reset_ts`` — see
+    ``WEEKLY_TIE_FRACTION``."""
+    return min((sooner_reset_ts - now) * WEEKLY_TIE_FRACTION, WEEKLY_TIE_MAX_S)
+
+
+def _break_weekly_ties_by_five_hour(
+    ranked: list[tuple[tuple, str]], now: float
+) -> list[tuple[tuple, str]]:
+    """Re-key consume-first's ``(weekly, five_hour, -headroom)`` keys so every
+    candidate whose weekly reset ties the soonest one sorts by its 5-hour reset
+    first: a running window that resets soonest is drained before it is lost,
+    and an idle account (no 5-hour reset, ``inf``) goes last in the tie. The
+    rest keep weekly order. Unknown weekly resets (``inf``) already sort last
+    and fall through to the 5-hour reset among themselves."""
+    soonest = min(key[0] for key, _ in ranked)
+    if soonest == float("inf"):
+        return ranked
+    band = _weekly_tie_band(soonest, now)
+    return [
+        (
+            (0, five_hour, neg_h)
+            if weekly - soonest <= band
+            else (1, weekly, five_hour, neg_h),
+            num,
+        )
+        for (weekly, five_hour, neg_h), num in ranked
+    ]
 
 
 def _binding_recovery_ts(
@@ -1773,8 +1822,9 @@ class AutoSwitchEngine:
         twice per tick: on the stored snapshot to decide provisionally, then
         on the escalated refetch to re-verify before switching.
         """
-        # consume-first ranks by soonest weekly reset; a proactive (below-
-        # threshold) target must reset strictly sooner than where we are.
+        # consume-first ranks by soonest weekly reset, the 5-hour reset
+        # breaking weekly ties; a proactive (below-threshold) target must
+        # reset sooner than where we are by more than a tie.
         active_reset_ts = (
             _seven_day_reset_ts(usage.get(current), now) if consume_first else None
         )
@@ -1901,10 +1951,15 @@ class AutoSwitchEngine:
                     # only move to accounts whose weekly window resets sooner
                     # than the active one (above the threshold we must move, so
                     # any healthy account qualifies and the sort picks soonest).
+                    # Sooner by more than a weekly tie: inside the band the
+                    # order cannot strand weekly quota, and leaving now would
+                    # abandon what is left of the active's running 5-hour
+                    # window.
                     if trigger == "consume-first" and (
                         reset_ts is None
                         or active_reset_ts is None
-                        or reset_ts >= active_reset_ts
+                        or reset_ts
+                        >= active_reset_ts - _weekly_tie_band(reset_ts, now)
                     ):
                         continue
                 elif active_headroom is not None:
@@ -1939,12 +1994,23 @@ class AutoSwitchEngine:
                     (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
                 )
             elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
+                # Soonest weekly reset first (unknown resets sort last), then
+                # soonest 5-hour reset (idle windows sort last), then most
+                # headroom, then sequence order. Weekly resets that merely tie
+                # are re-keyed after the loop, once the soonest is known.
+                five_hour_ts = _window_reset_ts(usage.get(num), "five_hour", now)
+                key = (
+                    reset_ts if reset_ts is not None else float("inf"),
+                    five_hour_ts if five_hour_ts is not None else float("inf"),
+                    -h,
+                )
             else:
                 key = (-h,)
             qualifying.append((key, num))
+        if consume_first and qualifying and not (
+            all_above and trigger in ("proactive", "consume-first")
+        ):
+            qualifying = _break_weekly_ties_by_five_hour(qualifying, now)
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
         qualifying.sort(key=lambda t: t[0])
