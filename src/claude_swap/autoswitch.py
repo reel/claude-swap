@@ -1888,7 +1888,7 @@ class AutoSwitchEngine:
         its own schedule, without the active ever needing to burn down to it.
 
         THE ORDINARY PATH HAS A REAL BASELINE (`leftHeadroom` is a number,
-        not null), so it gets three legs, checked in this order, each with
+        not null), so it gets four legs, checked in this order, each with
         the margin its axis already uses. Burn cannot manufacture any of
         them: headroom rises only when a window rolls over, the ratio needs
         the active to lose more than half its remaining headroom AND clear
@@ -1918,6 +1918,12 @@ class AutoSwitchEngine:
           recovery    `-RECOVERY_HYSTERESIS_S` against the DEPARTURE
                       baseline — longer than one poll cycle, so jitter on a
                       reset timestamp is not a recovery.
+          rolled over `leftRecoveryAt` has passed: the window that bound the
+                      departure has reset since. Wall clock crossing a
+                      recorded instant, which burn cannot fake. The headroom
+                      leg misses it whenever another window sits just under
+                      the threshold — left at 5h 90.5 with the week at 88,
+                      back at 5h 0 with the week at 88.5, is +2 pts.
 
         NO SNAPSHOT MEANS RELEASE. State written before this field existed, or
         by a switch that never recorded one, carries no evidence either way —
@@ -2038,6 +2044,8 @@ class AutoSwitchEngine:
                 )
                 and peer_recovery_ts < active_recovery_ts - RECOVERY_HYSTERESIS_S
             )
+        if isinstance(left_recovery, (int, float)) and left_recovery <= now:
+            return True          # the departure's binding window has reset
         # Dominance over the ACTIVE, only reached once a real baseline is
         # confirmed to exist above -- a peer that was already miles ahead of
         # the active at departure (moved for a DIFFERENT reason -- e.g.

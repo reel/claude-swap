@@ -3457,6 +3457,54 @@ class TestConsumeFirstFiveHourTiebreak:
         assert h.active_number() == 2
 
 
+
+class TestConsumeFirstReturnsAfterTheBindingWindowRollsOver:
+    """Leaving an account because its 5-hour window capped, then watching that
+    window reset, is the canonical recovery: the window that bound the
+    departure is gone. The headroom leg cannot see it when the weekly window
+    sits in the high 80s — 90.5 on the 5h at departure (9.5 pts) against 88.5
+    on the 7d after the reset (11.5 pts) is +2, under SPENT_HEADROOM_PCT — so
+    the no-return bar held the engine off the account whose week ends first
+    until that week expired with ~10% unspent."""
+
+    def test_returns_once_the_departure_window_has_reset(self, temp_home):
+        h = EngineHarness(temp_home, strategy="consume-first")
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        t0 = h.clock.now
+        at = lambda dt: dt - (h.clock.now - t0)  # fixed instants as t advances
+        far1 = lambda: _usage_both(20, at(4 * _HOUR), 10, at(6 * _DAY), h.clock.now)
+        far3 = lambda: _usage_both(0, None, 10, at(6 * _DAY + _HOUR), h.clock.now)
+
+        # #2 has 12% of its week left and the week ends in a day: drain it.
+        assert h.tick_with_usage({
+            "1": far1(),
+            "2": _usage_both(20, at(2 * _HOUR), 88, at(_DAY), h.clock.now),
+            "3": far3(),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        # Its 5-hour window caps: move off, the 5h reset an hour away.
+        h.clock.advance(301)
+        assert h.tick_with_usage({
+            "1": far1(),
+            "2": _usage_both(90.5, at(2 * _HOUR), 88, at(_DAY), h.clock.now),
+            "3": far3(),
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() != 2
+
+        # That 5-hour window has reset; the week still ends first.
+        h.clock.advance(2 * _HOUR)
+        outcome = h.tick_with_usage({
+            "1": far1(),
+            "2": _usage_both(0, None, 88.5, at(_DAY), h.clock.now),
+            "3": far3(),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
 class TestConsumeFirstDepartureRecordsItsOwnTrigger:
     """A `consume-first` departure's phase-2 refetch can write
     `(leftHeadroom, leftRecoveryAt) = (None, None)`, the exact snapshot
